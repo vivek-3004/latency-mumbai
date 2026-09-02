@@ -5,6 +5,8 @@ import https from 'https';
 import dns from 'dns/promises';
 import net from 'net';
 import { WebSocket } from 'ws';
+import { createServer } from 'http'; 
+
 
 // ─── CONFIG FROM ENV ───
 const NODE_ID = process.env.NODE_ID || 'mumbai';
@@ -12,6 +14,7 @@ const CENTRAL_URL = process.env.CENTRAL_WS_URL || 'wss://latency-central.onrende
 const PEERS = JSON.parse(process.env.PEER_IDS || '["delhi","singapore","tokyo","sydney","dubai","london","frankfurt","virginia","california","brazil","southafrica"]');
 const PROBE_INTERVAL = parseInt(process.env.PROBE_INTERVAL || '10000'); // 10s
 const PROBE_TIMEOUT = 3000;
+const PORT = process.env.PORT || 10000;
 
 console.log(`[${NODE_ID}] Starting — Peers: ${PEERS.join(', ')}`);
 console.log(`[${NODE_ID}] Central: ${CENTRAL_URL}`);
@@ -47,6 +50,35 @@ function connect() {
 }
 
 connect();
+
+// ─── HEALTH CHECK HTTP SERVER (required by Render) ───
+const healthServer = createServer((req, res) => {
+  if (req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ 
+      status: 'ok', 
+      nodeId: NODE_ID,
+      centralConnected: ws?.readyState === WebSocket.OPEN,
+      uptime: process.uptime()
+    }));
+  } else {
+    res.writeHead(404);
+    res.end('Not Found');
+  }
+});
+
+healthServer.listen(PORT, '0.0.0.0', () => {
+  console.log(`[${NODE_ID}] Health server listening on port ${PORT}`);
+});
+
+// ─── UPDATE GRACEFUL SHUTDOWN ███
+process.on('SIGTERM', () => {
+  console.log(`[${NODE_ID}] SIGTERM received, shutting down...`);
+  if (probeTimer) clearInterval(probeTimer);
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  if (ws) ws.close();
+  healthServer.close(() => process.exit(0));  // ███ CHANGED
+});
 
 // ─── GRACEFUL SHUTDOWN (Render sends SIGTERM) ───
 process.on('SIGTERM', () => {
