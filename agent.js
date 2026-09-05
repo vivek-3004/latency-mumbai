@@ -1,6 +1,3 @@
-// agent.js — Deploy as 12 separate Web Services on Render
-// Each with different NODE_ID env var
-
 import dgram from 'dgram';
 import https from 'https';
 import http from 'http';
@@ -8,11 +5,10 @@ import { performance } from 'perf_hooks';
 import dns from 'dns/promises';
 import tls from 'tls';
 
-
-// ─── CONFIG FROM ENV ───
+// ─── CONFIG ───
 const NODE_ID = process.env.NODE_ID || 'mumbai';
 const REGION = process.env.REGION || 'Asia';
-const CENTRAL_URL = process.env.CENTRAL_WS_URL || 'wss://latency-central.onrender.com';
+const CENTRAL_WS = process.env.CENTRAL_WS || 'wss://latency-central.onrender.com/ws';
 const PROBE_INTERVAL = parseInt(process.env.PROBE_INTERVAL || '10000'); // 10s
 const PORT = process.env.PORT || 10000;
 
@@ -22,7 +18,6 @@ const PEERS = [
   'dubai', 'london', 'frankfurt', 'virginia', 'california',
   'brazil', 'southafrica'
 ].filter(p => p !== NODE_ID);
-
 
 // Probe targets (HTTP endpoints on peer nodes)
 const PROBE_TARGETS = PEERS.map(peer => ({
