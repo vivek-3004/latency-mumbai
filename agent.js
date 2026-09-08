@@ -8,7 +8,7 @@ import tls from 'tls';
 // ─── CONFIG ───
 const NODE_ID = process.env.NODE_ID || 'mumbai';
 const REGION = process.env.REGION || 'Asia';
-const CENTRAL_WS = process.env.CENTRAL_WS || 'wss://latency-central.onrender.com/ws';
+const CENTRAL_WS = process.env.CENTRAL_WS || 'wss://central-elxh.onrender.com/ws';
 const PROBE_INTERVAL = parseInt(process.env.PROBE_INTERVAL || '10000'); // 10s
 const PORT = process.env.PORT || 10000;
 
