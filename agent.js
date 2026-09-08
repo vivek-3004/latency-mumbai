@@ -12,6 +12,47 @@ const CENTRAL_WS = process.env.CENTRAL_WS || 'wss://latency-central.onrender.com
 const PROBE_INTERVAL = parseInt(process.env.PROBE_INTERVAL || '10000'); // 10s
 const PORT = process.env.PORT || 10000;
 
+// ─── MEMORY LIMITS ───
+const MAX_LOCAL_HISTORY = 20;           // Keep only last 20 probes per peer
+const MEMORY_CHECK_INTERVAL = 60000;    // Check every 1 minute
+const MEMORY_THRESHOLD_MB = 400;        // Trigger cleanup at 400MB
+
+// ─── CIRCULAR BUFFER (BOUNDED STORAGE) ───
+class CircularBuffer {
+  constructor(maxSize) {
+    this.maxSize = maxSize;
+    this.buffer = [];
+    this.writeIndex = 0;
+    this.full = false;
+  }
+
+  push(item) {
+    this.buffer[this.writeIndex] = item;
+    this.writeIndex = (this.writeIndex + 1) % this.maxSize;
+    if (this.writeIndex === 0) this.full = true;
+  }
+
+  getAll() {
+    if (!this.full) return this.buffer.slice(0, this.writeIndex);
+    return [...this.buffer.slice(this.writeIndex), ...this.buffer.slice(0, this.writeIndex)];
+  }
+
+  getLatest() {
+    if (this.buffer.length === 0) return null;
+    return this.buffer[(this.writeIndex - 1 + this.maxSize) % this.maxSize];
+  }
+
+  size() {
+    return this.full ? this.maxSize : this.writeIndex;
+  }
+
+  clear() {
+    this.buffer = [];
+    this.writeIndex = 0;
+    this.full = false;
+  }
+}
+
 // ─── PEER NODES TO PROBE ───
 const PEERS = [
   'mumbai', 'delhi', 'singapore', 'tokyo', 'sydney',
@@ -26,6 +67,9 @@ const PROBE_TARGETS = PEERS.map(peer => ({
   port: 443,
   path: '/probe'
 }));
+
+// ─── BOUNDED LOCAL PROBE HISTORY ───
+const probeHistory = new Map();  // peer -> CircularBuffer
 
 // ─── HTTP SERVER (REQUIRED BY RENDER) ───
 const server = http.createServer((req, res) => {
@@ -42,6 +86,13 @@ const server = http.createServer((req, res) => {
 
   // Root — status page
   if (req.url === '/' || req.url === '/health') {
+    const memUsage = process.memoryUsage();
+    const recentProbes = [];
+    for (const buffer of probeHistory.values()) {
+      const latest = buffer.getLatest();
+      if (latest) recentProbes.push(latest);
+    }
+    
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status: 'ok',
@@ -50,7 +101,16 @@ const server = http.createServer((req, res) => {
       region: REGION,
       uptime: process.uptime(),
       wsConnected: ws && ws.readyState === 1,
-      lastProbes: probeHistory.slice(-5),
+      memory: {
+        heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024) + 'MB',
+        heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024) + 'MB'
+      },
+      stats: {
+        peersTracked: probeHistory.size,
+        totalProbesStored: Array.from(probeHistory.values()).reduce((s, b) => s + b.size(), 0),
+        avgLatency: avgLatency().toFixed(2)
+      },
+      lastProbes: recentProbes.slice(-5),
       endpoints: {
         root: '/',
         health: '/health',
@@ -74,14 +134,27 @@ const server = http.createServer((req, res) => {
 
   // Stats endpoint
   if (req.url === '/stats') {
+    const memUsage = process.memoryUsage();
+    const totalProbes = Array.from(probeHistory.values())
+      .reduce((sum, buf) => sum + buf.size(), 0);
+    
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       nodeId: NODE_ID,
       region: REGION,
-      totalProbes: probeHistory.length,
+      totalProbes: totalProbes,
+      peersTracked: probeHistory.size,
       avgLatency: avgLatency(),
       uptime: process.uptime(),
-      wsConnected: ws && ws.readyState === 1
+      wsConnected: ws && ws.readyState === 1,
+      memory: {
+        heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024) + 'MB',
+        heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024) + 'MB'
+      },
+      storage: {
+        maxProbesPerPeer: MAX_LOCAL_HISTORY,
+        maxTotalProbes: MAX_LOCAL_HISTORY * PEERS.length
+      }
     }, null, 2));
     return;
   }
@@ -98,7 +171,6 @@ const server = http.createServer((req, res) => {
 // ─── WEBSOCKET CLIENT (CONNECTS TO CENTRAL) ───
 let ws = null;
 let reconnectAttempts = 0;
-const probeHistory = [];
 
 function connectWS() {
   console.log(`[${NODE_ID}] Connecting to ${CENTRAL_WS}...`);
@@ -188,7 +260,7 @@ function httpsRequest(target) {
       method: 'GET',
       timeout: 5000,
       agent: new https.Agent({
-        rejectUnauthorized: false, // Render uses valid certs anyway
+        rejectUnauthorized: false,
         keepAlive: true
       })
     }, (res) => {
@@ -221,9 +293,16 @@ async function runProbes() {
   );
 
   results.forEach(result => {
-    probeHistory.push(result);
-    if (probeHistory.length > 100) probeHistory.shift();
+    // ─── BOUNDED STORAGE WITH CIRCULAR BUFFER ───
+    const peerId = result.to;
     
+    if (!probeHistory.has(peerId)) {
+      probeHistory.set(peerId, new CircularBuffer(MAX_LOCAL_HISTORY));
+    }
+    
+    probeHistory.get(peerId).push(result);
+    
+    // Send to central
     if (ws && ws.readyState === 1) {
       ws.send(JSON.stringify({
         type: 'probe-result',
@@ -240,9 +319,20 @@ async function runProbes() {
 }
 
 function avgLatency() {
-  const valid = probeHistory.filter(p => p.latency > 0);
-  if (valid.length === 0) return 0;
-  return valid.reduce((a, b) => a + b.latency, 0) / valid.length;
+  let total = 0;
+  let count = 0;
+  
+  for (const buffer of probeHistory.values()) {
+    const probes = buffer.getAll();
+    probes.forEach(p => {
+      if (p.latency > 0) {
+        total += p.latency;
+        count++;
+      }
+    });
+  }
+  
+  return count > 0 ? total / count : 0;
 }
 
 // ─── HEARTBEAT ───
@@ -252,12 +342,44 @@ setInterval(() => {
   }
 }, 30000);
 
+// ─── MEMORY MONITORING ───
+setInterval(() => {
+  const memUsage = process.memoryUsage();
+  const heapMB = Math.round(memUsage.heapUsed / 1024 / 1024);
+  const totalMB = Math.round(memUsage.heapTotal / 1024 / 1024);
+  
+  const totalProbes = Array.from(probeHistory.values())
+    .reduce((sum, buf) => sum + buf.size(), 0);
+  
+  console.log(`[${NODE_ID}] 📊 Memory: ${heapMB}MB / ${totalMB}MB | Probes: ${totalProbes} | Peers: ${probeHistory.size}`);
+  
+  // Auto-cleanup if memory is high
+  if (heapMB > MEMORY_THRESHOLD_MB) {
+    console.log(`[${NODE_ID}] ⚠️ Memory high (${heapMB}MB), forcing GC...`);
+    
+    // Clear oldest half of each buffer
+    for (const buffer of probeHistory.values()) {
+      const all = buffer.getAll();
+      const half = all.slice(Math.floor(all.length / 2));
+      buffer.clear();
+      half.forEach(p => buffer.push(p));
+    }
+    
+    if (global.gc) {
+      global.gc();
+    }
+    
+    console.log(`[${NODE_ID}] 🧹 Cleanup complete`);
+  }
+}, MEMORY_CHECK_INTERVAL);
+
 // ─── START ───
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Probe node [${NODE_ID}] running on port ${PORT}`);
   console.log(`   Region: ${REGION}`);
   console.log(`   Peers: ${PEERS.length}`);
   console.log(`   Central: ${CENTRAL_WS}`);
+  console.log(`   Memory limit: ${MAX_LOCAL_HISTORY}/peer (${MAX_LOCAL_HISTORY * PEERS.length} total)`);
 });
 
 connectWS();
@@ -270,6 +392,6 @@ setInterval(runProbes, PROBE_INTERVAL);
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
-  console.log('SIGTERM received, shutting down...');
+  console.log(`[${NODE_ID}] SIGTERM received, shutting down...`);
   server.close(() => process.exit(0));
 });
